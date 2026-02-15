@@ -89,6 +89,180 @@ class Sam3VideoProcessor(ProcessorMixin):
 
         return encoding_image_processor
 
+    def _resolve_original_size_for_prompt(
+        self,
+        inference_session: Sam3VideoInferenceSession,
+        original_size: tuple[int, int] | list[int] | torch.Tensor | None,
+    ) -> tuple[int, int]:
+        if original_size is None:
+            if inference_session.video_height is None or inference_session.video_width is None:
+                raise ValueError(
+                    "Either inference_session.video_height/video_width must be set, or original_size must be provided."
+                )
+            return int(inference_session.video_height), int(inference_session.video_width)
+
+        if isinstance(original_size, torch.Tensor):
+            original_size = original_size.cpu().tolist()
+
+        if isinstance(original_size, (list, tuple)):
+            if len(original_size) == 2 and all(isinstance(v, (int, float)) for v in original_size):
+                return int(original_size[0]), int(original_size[1])
+            if (
+                len(original_size) == 1
+                and isinstance(original_size[0], (list, tuple))
+                and len(original_size[0]) == 2
+                and all(isinstance(v, (int, float)) for v in original_size[0])
+            ):
+                return int(original_size[0][0]), int(original_size[0][1])
+
+        raise ValueError(f"original_size must be [height, width] (or [[height, width]]), got {original_size!r}.")
+
+    def _prepare_prompt_boxes(
+        self,
+        input_boxes: list[list[float]] | torch.Tensor,
+        input_boxes_labels: list[int] | torch.Tensor | None,
+        original_size: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(input_boxes, torch.Tensor):
+            boxes = input_boxes.detach().clone().to(dtype=torch.float32)
+        else:
+            boxes = torch.tensor(input_boxes, dtype=torch.float32)
+
+        if boxes.ndim == 1:
+            if boxes.numel() != 4:
+                raise ValueError(f"input_boxes must have 4 coordinates per box, got shape {tuple(boxes.shape)}.")
+            boxes = boxes.unsqueeze(0)
+        if boxes.ndim == 3 and boxes.shape[0] == 1:
+            boxes = boxes.squeeze(0)
+        if boxes.ndim != 2 or boxes.shape[-1] != 4:
+            raise ValueError(
+                "input_boxes must have shape [num_boxes, 4] (or [4] for a single box), "
+                f"got shape {tuple(boxes.shape)}."
+            )
+
+        old_h, old_w = original_size
+
+        # Validate box coordinates before normalization
+        x0, y0, x1, y1 = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
+        invalid_boxes = (x1 < x0) | (y1 < y0)
+        if torch.any(invalid_boxes):
+            invalid_idx = torch.where(invalid_boxes)[0].tolist()
+            raise ValueError(
+                f"input_boxes must be in valid XYXY format with x1 >= x0 and y1 >= y0. "
+                f"Found invalid boxes at indices: {invalid_idx}"
+            )
+
+        # Normalize coordinates
+        boxes[..., 0] = boxes[..., 0] / old_w
+        boxes[..., 1] = boxes[..., 1] / old_h
+        boxes[..., 2] = boxes[..., 2] / old_w
+        boxes[..., 3] = boxes[..., 3] / old_h
+        x0, y0, x1, y1 = boxes.unbind(-1)
+        boxes = torch.stack(((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0), (y1 - y0)), dim=-1).unsqueeze(0)
+
+        box_labels = None
+        if input_boxes_labels is not None:
+            if isinstance(input_boxes_labels, torch.Tensor):
+                box_labels = input_boxes_labels.detach().clone().to(dtype=torch.int64)
+            else:
+                box_labels = torch.tensor(input_boxes_labels, dtype=torch.int64)
+
+            if box_labels.ndim == 0:
+                box_labels = box_labels.unsqueeze(0)
+            if box_labels.ndim == 2 and box_labels.shape[0] == 1:
+                box_labels = box_labels.squeeze(0)
+            if box_labels.ndim != 1:
+                raise ValueError(
+                    "input_boxes_labels must have shape [num_boxes] (or scalar for one box), "
+                    f"got shape {tuple(box_labels.shape)}."
+                )
+            if box_labels.shape[0] != boxes.shape[1]:
+                raise ValueError(
+                    f"Number of box labels ({box_labels.shape[0]}) must match number of boxes ({boxes.shape[1]})."
+                )
+            box_labels = box_labels.unsqueeze(0)
+
+        return boxes, box_labels
+
+    def add_prompt(
+        self,
+        inference_session: Sam3VideoInferenceSession,
+        text: str | None = None,
+        input_boxes: list[list[float]] | torch.Tensor | None = None,
+        input_boxes_labels: list[int] | torch.Tensor | None = None,
+        original_size: tuple[int, int] | list[int] | torch.Tensor | None = None,
+        prompt_id: int | None = None,
+        deduplicate_text: bool = False,
+    ) -> int:
+        """
+        Add or update a prompt in the inference session.
+
+        Args:
+            inference_session (`Sam3VideoInferenceSession`):
+                The inference session.
+            text (`str`, *optional*):
+                Text prompt for detection. If omitted while `input_boxes` are provided, an existing prompt text
+                is reused when `prompt_id` is provided, otherwise `"visual"` is used.
+            input_boxes (`list[list[float]]` or `torch.Tensor`, *optional*):
+                Bounding box prompt(s) in absolute XYXY format for one prompt.
+                If provided for an existing `prompt_id`, replaces any previously stored boxes.
+            input_boxes_labels (`list[int]` or `torch.Tensor`, *optional*):
+                Optional labels for the input boxes.
+            original_size (`tuple[int, int]`, `list[int]`, or `torch.Tensor`, *optional*):
+                Original frame size as `(height, width)`. Required if the inference session has no video size.
+            prompt_id (`int`, *optional*):
+                Explicit prompt ID to update. If omitted, a new prompt ID is created unless deduplicated.
+            deduplicate_text (`bool`, *optional*, defaults to `False`):
+                Whether to reuse an existing prompt ID for identical text (exact match).
+
+        Returns:
+            `int`: Prompt ID.
+        """
+        if text is None and input_boxes is None:
+            raise ValueError("At least one of text or input_boxes must be provided.")
+        if input_boxes is None and input_boxes_labels is not None:
+            raise ValueError("input_boxes_labels cannot be provided when input_boxes is None.")
+        if text is not None and not isinstance(text, str):
+            raise ValueError(f"text must be a string when provided, got {type(text)}.")
+        if prompt_id is not None and prompt_id < 0:
+            raise ValueError(f"prompt_id must be >= 0, got {prompt_id}.")
+
+        if text is not None:
+            prompt_text = text
+        elif prompt_id is not None and prompt_id in inference_session.prompts:
+            prompt_text = inference_session.prompts[prompt_id]
+        else:
+            prompt_text = "visual"
+        boxes = None
+        boxes_labels = None
+        if input_boxes is not None:
+            resolved_original_size = self._resolve_original_size_for_prompt(inference_session, original_size)
+            boxes, boxes_labels = self._prepare_prompt_boxes(input_boxes, input_boxes_labels, resolved_original_size)
+
+        prompt_id = inference_session.add_prompt(
+            prompt_text=prompt_text,
+            prompt_id=prompt_id,
+            deduplicate_text=deduplicate_text,
+        )
+
+        if prompt_id not in inference_session.prompt_input_ids:
+            encoded_text = self.tokenizer(prompt_text, return_tensors="pt", padding="max_length", max_length=32).to(
+                inference_session.inference_device
+            )
+            inference_session.prompt_input_ids[prompt_id] = encoded_text.input_ids
+            inference_session.prompt_attention_masks[prompt_id] = encoded_text.attention_mask
+
+        if boxes is not None:
+            inference_session.prompt_input_boxes[prompt_id] = boxes.to(inference_session.inference_device)
+            if boxes_labels is not None:
+                inference_session.prompt_input_boxes_labels[prompt_id] = boxes_labels.to(
+                    inference_session.inference_device
+                )
+            else:
+                inference_session.prompt_input_boxes_labels.pop(prompt_id, None)
+
+        return prompt_id
+
     def add_text_prompt(self, inference_session: Sam3VideoInferenceSession, text: str | list[str]):
         """
         Add text prompt(s) to the inference session.
@@ -103,22 +277,49 @@ class Sam3VideoProcessor(ProcessorMixin):
         if isinstance(text, str):
             text = [text]
 
-        prompt_ids = []
         for prompt_text in text:
-            # Add prompt and get its ID (reuses existing if duplicate)
-            prompt_id = inference_session.add_prompt(prompt_text)
+            self.add_prompt(
+                inference_session=inference_session,
+                text=prompt_text,
+                deduplicate_text=True,
+            )
 
-            # Only encode if this is a new prompt (not already in prompt_input_ids)
-            if prompt_id not in inference_session.prompt_input_ids:
-                encoded_text = self.tokenizer(
-                    prompt_text, return_tensors="pt", padding="max_length", max_length=32
-                ).to(inference_session.inference_device)
+        return inference_session
 
-                inference_session.prompt_input_ids[prompt_id] = encoded_text.input_ids
-                inference_session.prompt_attention_masks[prompt_id] = encoded_text.attention_mask
+    def add_box_prompt(
+        self,
+        inference_session: Sam3VideoInferenceSession,
+        input_boxes: list[list[float]] | torch.Tensor,
+        input_boxes_labels: list[int] | torch.Tensor | None = None,
+        original_size: tuple[int, int] | list[int] | torch.Tensor | None = None,
+        prompt_id: int | None = None,
+    ):
+        """
+        Add or update a box prompt in the inference session.
 
-            prompt_ids.append(prompt_id)
+        Args:
+            inference_session (`Sam3VideoInferenceSession`):
+                The inference session.
+            input_boxes (`list[list[float]]` or `torch.Tensor`):
+                Bounding box prompt(s) in absolute XYXY format for one prompt.
+            input_boxes_labels (`list[int]` or `torch.Tensor`, *optional*):
+                Optional labels for input boxes.
+            original_size (`tuple[int, int]`, `list[int]`, or `torch.Tensor`, *optional*):
+                Original frame size as `(height, width)`. Required if the inference session has no video size.
+            prompt_id (`int`, *optional*):
+                Existing prompt ID to update. When omitted, a new prompt is created with text
+                `"visual"` (the Sam3 convention for box-only prompts).
 
+        Returns:
+            `Sam3VideoInferenceSession`: The inference session with the added/updated box prompt.
+        """
+        self.add_prompt(
+            inference_session=inference_session,
+            input_boxes=input_boxes,
+            input_boxes_labels=input_boxes_labels,
+            original_size=original_size,
+            prompt_id=prompt_id,
+        )
         return inference_session
 
     def init_video_session(
@@ -261,8 +462,10 @@ class Sam3VideoProcessor(ProcessorMixin):
                   (top_left_x, top_left_y, bottom_right_x, bottom_right_y).
                 - **masks** (`torch.Tensor` of shape `(num_objects, height, width)`): Binary segmentation masks
                   for each object at the original video resolution.
-                - **prompt_to_obj_ids** (`dict[str, list[int]]`): Mapping from prompt text to list of
+                - **prompt_id_to_obj_ids** (`dict[int, list[int]]`): Mapping from prompt ID to list of
                   object IDs detected by that prompt.
+                - **prompt_to_obj_ids** (`dict[str, list[int]]`): Compatibility mapping from prompt text to list of
+                  object IDs detected by prompts with that text.
         """
         obj_id_to_mask = model_outputs["obj_id_to_mask"]  # low res masks (1, H_low, W_low)
         curr_obj_ids = sorted(obj_id_to_mask.keys())
@@ -345,10 +548,12 @@ class Sam3VideoProcessor(ProcessorMixin):
                 ).squeeze(1)
             ) > 0
 
-        # Build prompt_to_obj_ids mapping: group object IDs by their associated prompt text.
+        # Build prompt mappings.
+        prompt_id_to_obj_ids = {}
         prompt_to_obj_ids = {}
         for obj_id in out_obj_ids.tolist():
             prompt_id = inference_session.obj_id_to_prompt_id[obj_id]
+            prompt_id_to_obj_ids.setdefault(prompt_id, []).append(obj_id)
             prompt_text = inference_session.prompts[prompt_id]
             prompt_to_obj_ids.setdefault(prompt_text, []).append(obj_id)
 
@@ -357,6 +562,7 @@ class Sam3VideoProcessor(ProcessorMixin):
             "scores": out_probs,
             "boxes": out_boxes_xyxy,
             "masks": out_binary_masks,
+            "prompt_id_to_obj_ids": prompt_id_to_obj_ids,
             "prompt_to_obj_ids": prompt_to_obj_ids,
         }
         return outputs

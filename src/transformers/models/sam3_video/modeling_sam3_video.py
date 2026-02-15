@@ -184,9 +184,12 @@ class Sam3VideoInferenceSession:
 
         # Multi-prompt support
         self.prompts = {}  # prompt_id -> prompt_text
+        self._next_prompt_id = 0
         self.prompt_input_ids = {}  # prompt_id -> input_ids
         self.prompt_embeddings = {}  # prompt_id -> text embeddings
         self.prompt_attention_masks = {}  # prompt_id -> attention_mask
+        self.prompt_input_boxes = {}  # prompt_id -> input_boxes
+        self.prompt_input_boxes_labels = {}  # prompt_id -> input_boxes_labels
         self.obj_id_to_prompt_id = {}  # obj_id -> prompt_id (assigned at detection time)
 
         # Tracking metadata for detection-tracking fusion
@@ -212,17 +215,47 @@ class Sam3VideoInferenceSession:
         """Number of frames in the video."""
         return len(self.processed_frames) if self.processed_frames is not None else None
 
-    def add_prompt(self, prompt_text: str) -> int:
+    def add_prompt(
+        self,
+        prompt_text: str,
+        prompt_id: int | None = None,
+        deduplicate_text: bool = True,
+    ) -> int:
         """
-        Add a text prompt to the session and return its unique ID.
-        If the prompt already exists, returns the existing ID.
-        """
-        for prompt_id, text in self.prompts.items():
-            if text == prompt_text:
-                return prompt_id
+        Add or update a text prompt and return its ID.
 
-        prompt_id = len(self.prompts)
+        Args:
+            prompt_text (`str`):
+                Prompt text to register.
+            prompt_id (`int`, *optional*):
+                Explicit prompt ID to update. If omitted, a new prompt ID is created unless deduplicated.
+            deduplicate_text (`bool`, *optional*, defaults to `True`):
+                If `True`, return an existing prompt ID when the prompt text already exists.
+                Note: the processor-level `add_prompt` defaults this to `False` for explicit control;
+                `add_text_prompt` passes `True` to preserve backward-compatible deduplication.
+        """
+        if prompt_id is None and deduplicate_text:
+            for existing_prompt_id, text in self.prompts.items():
+                if text == prompt_text:
+                    return existing_prompt_id
+
+        if prompt_id is None:
+            prompt_id = self._next_prompt_id
+            self._next_prompt_id += 1
+        elif prompt_id < 0:
+            raise ValueError(f"prompt_id must be >= 0, got {prompt_id}.")
+        else:
+            self._next_prompt_id = max(self._next_prompt_id, prompt_id + 1)
+
+        text_changed = prompt_id in self.prompts and self.prompts[prompt_id] != prompt_text
         self.prompts[prompt_id] = prompt_text
+
+        if text_changed:
+            # Text changed for an existing prompt ID; force re-tokenization/re-embedding.
+            self.prompt_input_ids.pop(prompt_id, None)
+            self.prompt_attention_masks.pop(prompt_id, None)
+            self.prompt_embeddings.pop(prompt_id, None)
+
         return prompt_id
 
     # Object management
@@ -448,9 +481,12 @@ class Sam3VideoInferenceSession:
 
         # Reset multi-prompt state
         self.prompts.clear()
+        self._next_prompt_id = 0
         self.prompt_input_ids.clear()
         self.prompt_embeddings.clear()
         self.prompt_attention_masks.clear()
+        self.prompt_input_boxes.clear()
+        self.prompt_input_boxes_labels.clear()
         self.obj_id_to_prompt_id.clear()
 
         # Clear cache
@@ -586,11 +622,15 @@ class Sam3VideoModel(Sam3VideoPreTrainedModel):
         all_detections = {}
 
         for prompt_id in prompt_ids:
+            attention_mask = inference_session.prompt_attention_masks[prompt_id]
+            input_boxes = inference_session.prompt_input_boxes.get(prompt_id)
+            input_boxes_labels = inference_session.prompt_input_boxes_labels.get(prompt_id)
+
             # Get or compute text embeddings for this prompt
             if prompt_id not in inference_session.prompt_embeddings:
                 text_embeds = self.detector_model.get_text_features(
                     input_ids=inference_session.prompt_input_ids[prompt_id],
-                    attention_mask=inference_session.prompt_attention_masks[prompt_id],
+                    attention_mask=attention_mask,
                     return_dict=True,
                 ).pooler_output
                 inference_session.prompt_embeddings[prompt_id] = text_embeds
@@ -601,7 +641,9 @@ class Sam3VideoModel(Sam3VideoPreTrainedModel):
             detector_outputs = self.detector_model(
                 vision_embeds=vision_embeds,
                 text_embeds=text_embeds,
-                attention_mask=inference_session.prompt_attention_masks[prompt_id],
+                attention_mask=attention_mask,
+                input_boxes=input_boxes,
+                input_boxes_labels=input_boxes_labels,
             )
 
             pred_logits = detector_outputs.pred_logits

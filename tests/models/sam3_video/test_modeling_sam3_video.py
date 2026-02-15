@@ -511,7 +511,17 @@ class Sam3VideoModelIntegrationTest(unittest.TestCase):
             self.assertIn("scores", processed_outputs)
             self.assertIn("boxes", processed_outputs)
             self.assertIn("masks", processed_outputs)
+            self.assertIn("prompt_id_to_obj_ids", processed_outputs)  # Multi-prompt specific
             self.assertIn("prompt_to_obj_ids", processed_outputs)  # Multi-prompt specific
+
+            # Check prompt_id_to_obj_ids structure
+            prompt_id_to_obj_ids = processed_outputs["prompt_id_to_obj_ids"]
+            self.assertIsInstance(prompt_id_to_obj_ids, dict)
+            for prompt_id, obj_ids in prompt_id_to_obj_ids.items():
+                self.assertIsInstance(prompt_id, int)
+                self.assertIsInstance(obj_ids, list)
+                for obj_id in obj_ids:
+                    self.assertIn(obj_id, processed_outputs["object_ids"].tolist())
 
             # Check prompt_to_obj_ids structure
             prompt_to_obj_ids = processed_outputs["prompt_to_obj_ids"]
@@ -533,6 +543,92 @@ class Sam3VideoModelIntegrationTest(unittest.TestCase):
         # All prompts in prompt_to_obj_ids should be from our original prompts
         for prompt in prompt_to_obj_ids.keys():
             self.assertIn(prompt, prompts)
+
+    def test_add_prompt_api_with_box_update_and_prompt_id_mapping(self):
+        inference_session = self.processor.init_video_session(inference_device=torch_device)
+
+        prompt_id_1 = self.processor.add_prompt(inference_session=inference_session, text="person")
+        prompt_id_2 = self.processor.add_prompt(inference_session=inference_session, text="person")
+        prompt_id_1_dedup = self.processor.add_prompt(
+            inference_session=inference_session, text="person", deduplicate_text=True
+        )
+
+        self.assertNotEqual(prompt_id_1, prompt_id_2)
+        self.assertEqual(prompt_id_1, prompt_id_1_dedup)
+
+        self.processor.add_prompt(
+            inference_session=inference_session,
+            prompt_id=prompt_id_1,
+            input_boxes=[[10.0, 20.0, 40.0, 60.0]],
+            original_size=(100, 200),
+        )
+
+        self.assertIn(prompt_id_1, inference_session.prompt_input_boxes)
+        self.assertEqual(inference_session.prompt_input_boxes[prompt_id_1].shape, (1, 1, 4))
+        torch.testing.assert_close(
+            inference_session.prompt_input_boxes[prompt_id_1].cpu(),
+            torch.tensor([[[0.1250, 0.4000, 0.1500, 0.4000]]], dtype=torch.float32),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+        self.processor.add_box_prompt(
+            inference_session=inference_session,
+            input_boxes=[[20.0, 10.0, 50.0, 40.0]],
+            original_size=(100, 200),
+            prompt_id=prompt_id_2,
+        )
+
+        inference_session.obj_id_to_prompt_id = {11: prompt_id_1, 12: prompt_id_2}
+        low_res_size = self.video_model.low_res_mask_size
+        obj_id_to_mask = {
+            11: torch.ones(1, low_res_size, low_res_size, dtype=torch.float32, device=torch_device),
+            12: torch.ones(1, low_res_size, low_res_size, dtype=torch.float32, device=torch_device),
+        }
+        model_outputs = {
+            "obj_id_to_mask": obj_id_to_mask,
+            "obj_id_to_score": {11: 0.9, 12: 0.8},
+            "obj_id_to_tracker_score": {11: 0.9, 12: 0.8},
+            "suppressed_obj_ids": set(),
+        }
+
+        processed_outputs = self.processor.postprocess_outputs(
+            inference_session,
+            model_outputs,
+            original_sizes=[[100, 200]],
+        )
+
+        self.assertIn("prompt_id_to_obj_ids", processed_outputs)
+        self.assertIn(prompt_id_1, processed_outputs["prompt_id_to_obj_ids"])
+        self.assertIn(prompt_id_2, processed_outputs["prompt_id_to_obj_ids"])
+        self.assertEqual(processed_outputs["prompt_id_to_obj_ids"][prompt_id_1], [11])
+        self.assertEqual(processed_outputs["prompt_id_to_obj_ids"][prompt_id_2], [12])
+
+        # Compatibility mapping aggregates duplicated prompt texts.
+        self.assertIn("person", processed_outputs["prompt_to_obj_ids"])
+        self.assertCountEqual(processed_outputs["prompt_to_obj_ids"]["person"], [11, 12])
+
+    def test_reset_clears_box_prompt_state(self):
+        inference_session = self.processor.init_video_session(inference_device=torch_device)
+
+        prompt_id = self.processor.add_prompt(
+            inference_session=inference_session,
+            text="person",
+            input_boxes=[[10.0, 20.0, 40.0, 60.0]],
+            original_size=(100, 200),
+        )
+
+        self.assertIn(prompt_id, inference_session.prompt_input_boxes)
+        self.assertIn(prompt_id, inference_session.prompts)
+
+        inference_session.reset_state()
+
+        self.assertEqual(len(inference_session.prompt_input_boxes), 0)
+        self.assertEqual(len(inference_session.prompt_input_boxes_labels), 0)
+        self.assertEqual(len(inference_session.prompts), 0)
+        self.assertEqual(len(inference_session.prompt_input_ids), 0)
+        self.assertEqual(len(inference_session.prompt_embeddings), 0)
+        self.assertEqual(len(inference_session.prompt_attention_masks), 0)
 
     def test_custom_image_size(self):
         """Test that custom image size can be set and propagates correctly to detector and tracker configs."""

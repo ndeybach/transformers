@@ -122,14 +122,40 @@ You can also track multiple object categories simultaneously by providing multip
 ...     processed_outputs = processor.postprocess_outputs(multi_prompt_session, model_outputs)
 ...     multi_outputs_per_frame[model_outputs.frame_idx] = processed_outputs
 >>>
->>> # Check which objects were detected by each prompt
+>>> # Check which objects were detected by each prompt ID
 >>> frame_0_outputs = multi_outputs_per_frame[0]
+>>> prompt_id_to_obj_ids = frame_0_outputs["prompt_id_to_obj_ids"]
+>>> for prompt_id, obj_ids in prompt_id_to_obj_ids.items():
+...     print(f"prompt {prompt_id}: {len(obj_ids)} objects")
+prompt 0: 2 objects
+prompt 1: 1 objects
+prompt 2: 1 objects
+>>>
+>>> # Compatibility mapping by text (aggregated when duplicate texts exist)
 >>> prompt_to_obj_ids = frame_0_outputs["prompt_to_obj_ids"]
 >>> for prompt, obj_ids in prompt_to_obj_ids.items():
 ...     print(f"{prompt}: {len(obj_ids)} objects")
 person: 2 objects
 bed: 1 objects
 lamp: 1 objects
+```
+
+You can also add a box prompt directly:
+
+```python
+>>> box_prompt_id = processor.add_prompt(
+...     inference_session=multi_prompt_session,
+...     text="person",
+...     input_boxes=[[30, 90, 180, 330]],  # XYXY absolute coordinates
+...     original_size=[video_frames.shape[-3], video_frames.shape[-2]],
+... )
+>>> # You can also update an existing prompt's boxes later:
+>>> processor.add_box_prompt(
+...     inference_session=multi_prompt_session,
+...     input_boxes=[[50, 100, 200, 350]],  # new box replaces the previous one
+...     original_size=[video_frames.shape[-3], video_frames.shape[-2]],
+...     prompt_id=box_prompt_id,
+... )
 ```
 
 #### Streaming Video Inference
@@ -215,7 +241,9 @@ For faster inference or lower memory usage:
     - __call__
     - postprocess_outputs
     - init_video_session
+    - add_prompt
     - add_text_prompt
+    - add_box_prompt
 
 ## Sam3VideoInferenceSession
 
